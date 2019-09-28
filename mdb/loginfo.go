@@ -54,13 +54,150 @@ type SlowOps struct {
 	Log   string
 }
 
+type OutputFormatterBase interface {
+	WriteHeader(buffer *bytes.Buffer)
+	WriteLine(buffer *bytes.Buffer, value *LogInfoLineAnalytics)
+	WriteFooter(buffer *bytes.Buffer)
+	GetOutput(li *LogInfo) string
+}
+
+type ScreenOutputFormatter struct {
+	OutputFormatterBase
+}
+
+type JSONOutputFormatter struct {
+	OutputFormatterBase
+	// FormatType string
+	// Filename   string
+	// Extension  string
+}
+
+// OpPerformanceDoc stores performance data
+type LogInfoLineAnalytics struct {
+	Namespace         string  `json:"namespace"`           // database.collectin
+	Command           string  `json:"command"`             // count, delete, find, remove, and update
+	QueryPattern      string  `json:"queryPattern"`        // query pattern
+	Count             int     `json:"count"`               // number of ops
+	MinMilliseconds   int     `json:"minMilliseconds"`     // min millisecond
+	MaxMilliseconds   int     `json:"maxMilliseconds"`     // max millisecond
+	AvgMilliseconds   float64 `json:"averageMilliseconds"` // max millisecond
+	TotalMilliseconds int     `json:"totalMilliseconds"`   // total milliseconds
+	IsCollectionScan  bool    `json:"isCollectionScan"`    // COLLSCAN
+	IndexUsed         string  `json:"indexUsed"`           // index used
+}
+
+// Write header in the ScreenOutputFormatter
+func (formatter *ScreenOutputFormatter) WriteHeader(buffer *bytes.Buffer) {
+	buffer.WriteString("\r+----------+--------+------+--------+------+---------------------------------+--------------------------------------------------------------+\n")
+	buffer.WriteString(fmt.Sprintf("| Command  |COLLSCAN|avg ms| max ms | Count| %-32s| %-60s |\n", "Namespace", "Query Pattern"))
+	buffer.WriteString("|----------+--------+------+--------+------+---------------------------------+--------------------------------------------------------------|\n")
+}
+
+// Write header in the ScreenOutputFormatter
+func (formatter *ScreenOutputFormatter) WriteLine(buffer *bytes.Buffer, value *LogInfoLineAnalytics) {
+	str := value.QueryPattern
+	if len(value.Command) > 10 {
+		value.Command = value.Command[:10]
+	}
+	if len(value.Namespace) > 33 {
+		length := len(value.Namespace)
+		value.Namespace = value.Namespace[:1] + "*" + value.Namespace[(length-31):]
+	}
+	if len(str) > 60 {
+		str = value.QueryPattern[:60]
+		idx := strings.LastIndex(str, " ")
+		str = value.QueryPattern[:idx]
+	}
+	output := ""
+	avg := float64(value.TotalMilliseconds) / float64(value.Count)
+	avgstr := MilliToTimeString(avg)
+
+	if value.IsCollectionScan {
+		output = fmt.Sprintf("|%-10s \x1b[31;1m%8s\x1b[0m %6s %8d %6d %-33s \x1b[31;1m%-62s\x1b[0m|\n", value.Command, "COLLSCAN",
+			avgstr, value.MaxMilliseconds, value.Count, value.Namespace, str)
+	} else {
+		output = fmt.Sprintf("|%-10s \x1b[31;1m%8s\x1b[0m %6s %8d %6d %-33s %-62s|\n", value.Command, "",
+			avgstr, value.MaxMilliseconds, value.Count, value.Namespace, str)
+	}
+	buffer.WriteString(output)
+	if len(value.QueryPattern) > 60 {
+		remaining := value.QueryPattern[len(str):]
+		for i := 0; i < len(remaining); i += 60 {
+			epos := i + 60
+			var pstr string
+			if epos > len(remaining) {
+				epos = len(remaining)
+				pstr = remaining[i:epos]
+			} else {
+				str = strings.Trim(remaining[i:epos], " ")
+				idx := strings.LastIndex(str, " ")
+				if idx > 0 {
+					pstr = str[:idx]
+					i -= (60 - idx)
+				}
+			}
+			if value.IsCollectionScan {
+				output = fmt.Sprintf("|%74s   \x1b[31;1m%-62s\x1b[0m|\n", " ", pstr)
+				buffer.WriteString(output)
+			} else {
+				output = fmt.Sprintf("|%74s   %-62s|\n", " ", pstr)
+				buffer.WriteString(output)
+			}
+		}
+	}
+	if value.IndexUsed != "" {
+		output = fmt.Sprintf("|...index:  \x1b[32;1m%-128s\x1b[0m|\n", value.IndexUsed)
+		buffer.WriteString(output)
+	}
+}
+
+// Write Footer for the ScreenOutputFormatter
+func (formatter *ScreenOutputFormatter) WriteFooter(buffer *bytes.Buffer) {
+	buffer.WriteString("+----------+--------+------+--------+------+---------------------------------+--------------------------------------------------------------+\n")
+}
+
+func (formatter *JSONOutputFormatter) WriteHeader(buffer *bytes.Buffer) {
+	buffer.WriteString("[\n")
+}
+
+func (formatter *JSONOutputFormatter) WriteFooter(buffer *bytes.Buffer) {
+	buffer.WriteString("]\n")
+}
+
+func ConverOpPerformanceDocumentToLogInfoLineAnalytics(value *OpPerformanceDoc) LogInfoLineAnalytics {
+	var stats LogInfoLineAnalytics = LogInfoLineAnalytics{}
+
+	stats.QueryPattern = value.Filter
+	stats.Command = value.Command
+	stats.Namespace = value.Namespace
+	stats.TotalMilliseconds = value.TotalMilli
+	stats.Count = value.Count
+	stats.AvgMilliseconds = float64(value.TotalMilli) / float64(value.Count)
+	stats.IsCollectionScan = value.Scan == COLLSCAN
+
+	if value.Index != "" {
+		stats.IndexUsed = value.Index
+	}
+
+	return stats
+}
+
+func (formatter *JSONOutputFormatter) WriteLine(buffer *bytes.Buffer, value *LogInfoLineAnalytics) {
+	// filter, command, namespace
+	data, _ := json.Marshal(value)
+	buffer.Write(data)
+	buffer.WriteString("\n")
+}
+
 // NewLogInfo -
-func NewLogInfo(filename string) *LogInfo {
+func NewLogInfo(filename string, exportType string) *LogInfo {
 	li := LogInfo{filename: filename, collscan: false, silent: false, verbose: false}
 	li.OutputFilename = filepath.Base(filename)
 	if strings.HasSuffix(li.OutputFilename, ".gz") {
 		li.OutputFilename = li.OutputFilename[:len(li.OutputFilename)-3]
 	}
+	// li.FormattedOutputFile += ".json" // csv, tsv etc
+	// li.Formatter = new
 	li.OutputFilename += ".enc"
 	return &li
 }
@@ -410,65 +547,16 @@ func (li *LogInfo) printLogsSummary() string {
 		summaries = append(summaries, "\n")
 	}
 	var buffer bytes.Buffer
-	buffer.WriteString("\r+----------+--------+------+--------+------+---------------------------------+--------------------------------------------------------------+\n")
-	buffer.WriteString(fmt.Sprintf("| Command  |COLLSCAN|avg ms| max ms | Count| %-32s| %-60s |\n", "Namespace", "Query Pattern"))
-	buffer.WriteString("|----------+--------+------+--------+------+---------------------------------+--------------------------------------------------------------|\n")
+	// var formatter ScreenOutputFormatter = ScreenOutputFormatter{}
+	var formatter JSONOutputFormatter = JSONOutputFormatter{}
+
+	formatter.WriteHeader(&buffer)
 	for _, value := range li.OpsPatterns {
-		str := value.Filter
-		if len(value.Command) > 10 {
-			value.Command = value.Command[:10]
-		}
-		if len(value.Namespace) > 33 {
-			length := len(value.Namespace)
-			value.Namespace = value.Namespace[:1] + "*" + value.Namespace[(length-31):]
-		}
-		if len(str) > 60 {
-			str = value.Filter[:60]
-			idx := strings.LastIndex(str, " ")
-			str = value.Filter[:idx]
-		}
-		output := ""
-		avg := float64(value.TotalMilli) / float64(value.Count)
-		avgstr := MilliToTimeString(avg)
-		if value.Scan == COLLSCAN {
-			output = fmt.Sprintf("|%-10s \x1b[31;1m%8s\x1b[0m %6s %8d %6d %-33s \x1b[31;1m%-62s\x1b[0m|\n", value.Command, value.Scan,
-				avgstr, value.MaxMilli, value.Count, value.Namespace, str)
-		} else {
-			output = fmt.Sprintf("|%-10s \x1b[31;1m%8s\x1b[0m %6s %8d %6d %-33s %-62s|\n", value.Command, value.Scan,
-				avgstr, value.MaxMilli, value.Count, value.Namespace, str)
-		}
-		buffer.WriteString(output)
-		if len(value.Filter) > 60 {
-			remaining := value.Filter[len(str):]
-			for i := 0; i < len(remaining); i += 60 {
-				epos := i + 60
-				var pstr string
-				if epos > len(remaining) {
-					epos = len(remaining)
-					pstr = remaining[i:epos]
-				} else {
-					str = strings.Trim(remaining[i:epos], " ")
-					idx := strings.LastIndex(str, " ")
-					if idx > 0 {
-						pstr = str[:idx]
-						i -= (60 - idx)
-					}
-				}
-				if value.Scan == COLLSCAN {
-					output = fmt.Sprintf("|%74s   \x1b[31;1m%-62s\x1b[0m|\n", " ", pstr)
-					buffer.WriteString(output)
-				} else {
-					output = fmt.Sprintf("|%74s   %-62s|\n", " ", pstr)
-					buffer.WriteString(output)
-				}
-			}
-		}
-		if value.Index != "" {
-			output = fmt.Sprintf("|...index:  \x1b[32;1m%-128s\x1b[0m|\n", value.Index)
-			buffer.WriteString(output)
-		}
+		var line LogInfoLineAnalytics = ConverOpPerformanceDocumentToLogInfoLineAnalytics(&value)
+		formatter.WriteLine(&buffer, &line)
 	}
-	buffer.WriteString("+----------+--------+------+--------+------+---------------------------------+--------------------------------------------------------------+\n")
+	formatter.WriteFooter(&buffer)
+
 	summaries = append(summaries, buffer.String())
 	return strings.Join(summaries, "\n")
 }

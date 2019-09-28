@@ -97,7 +97,7 @@ func main() {
 		for _, filename := range filenames {
 			fmt.Println("=> processing", filename)
 			var str string
-			li := mdb.NewLogInfo(filename)
+			li := mdb.NewLogInfo(filename, "")
 			li.SetVerbose(*verbose)
 			if str, err = li.Analyze(); err != nil {
 				log.Println(err)
@@ -108,7 +108,7 @@ func main() {
 		os.Exit(0)
 	} else if *loginfo != "" {
 		var str string
-		li := mdb.NewLogInfo(*loginfo)
+		li := mdb.NewLogInfo(*loginfo, "")
 		li.SetCollscan(*collscan)
 		li.SetVerbose(*verbose)
 		if str, err = li.Analyze(); err != nil {
